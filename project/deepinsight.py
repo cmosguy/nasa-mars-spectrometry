@@ -130,14 +130,6 @@ def plot_feature_density(it, pixels=100, show_grid=True, title=None):
     plt.suptitle("Feauture Overlap Counts")
 
 
-resolution = 50
-plot_feature_density(
-    it,
-    pixels=resolution,
-    title=
-    f"All Feature Density Matrix of Training Set (Resolution: {resolution}x{resolution})"
-)
-
 #%%
 def plot_embed_2D(X, title=None):
     sns.set(style="darkgrid")
@@ -199,6 +191,13 @@ tsne = TSNE(n_components=2,
 pixels = 50
 it = ImageTransformer( feature_extractor=tsne, pixels=pixels)
 
+# plot_feature_density(
+#     it,
+#     pixels=pixels,
+#     title=
+#     f"All Feature Density Matrix of Training Set (Resolution: {pixels}x{pixels})"
+# )
+
 
 X_train_img = it.fit_transform(processed_splits['train'])
 X_val_img = it.transform(processed_splits['val'])
@@ -211,14 +210,11 @@ for i in range(0,3):
 plt.tight_layout()
 
 #%%squeeze net
-
-if torch.cuda.is_available():
-	device = torch.device("cuda:0")
-else:
-	device = torch.device("cpu")
-
 compounds = dataset.train_labels.columns
 
+preprocess = transforms.Compose([
+	transforms.ToTensor()
+])
 
 nets = {}
 X_train_tensor = torch.stack([preprocess(img) for img in X_train_img])
@@ -230,63 +226,60 @@ val_predictions = {}
 test_predictions = {}
 
 
+model = torch.hub.load(
+	'pytorch/vision:v0.6.0', 'squeezenet1_1', 
+	pretrained=False, verbose=False).double()
 
-for compound in compounds:
-	print('Training model for {}'.format(compound))
-	nets[compound] = torch.hub.load(
-		'pytorch/vision:v0.6.0', 'squeezenet1_1', 
-		pretrained=False, verbose=False).double()
+model.classifier[1] = nn.Conv2d(512, 10, kernel_size=(1,1), stride=(1,1)).double()
 
-	nets[compound].classifier[1] = nn.Conv2d(512, 2, kernel_size=(1,1), stride=(1,1)).double()
+#%%
+list(model.children())[-3:]
 
-	preprocess = transforms.Compose([
-		transforms.ToTensor()
-	])
+#%%
 
+y_train_tensor = torch.from_numpy(dataset.train_labels.values)
+y_val_tensor = torch.from_numpy(dataset.val_labels.values)
 
-	y_train_tensor = torch.from_numpy(dataset.train_labels[compound].values)
-	y_val_tensor = torch.from_numpy(dataset.val_labels[compound].values)
+batch_size = 1
 
-	batch_size = 1
+trainset = TensorDataset(X_train_tensor, y_train_tensor)
+trainloader = DataLoader(trainset, batch_size=batch_size, shuffle=True)
 
-	trainset = TensorDataset(X_train_tensor, y_train_tensor)
-	trainloader = DataLoader(trainset, batch_size=batch_size, shuffle=True)
+criterion = nn.CrossEntropyLoss()
+optimizer = optim.SGD(model.parameters(), lr=1e-4, momentum=0.9)
 
-	criterion = nn.CrossEntropyLoss()
-	optimizer = optim.SGD(nets[compound].parameters(), lr=1e-4, momentum=0.9)
+for epoch in range(20):
 
-	for epoch in range(20):
+	running_loss = 0.0
+	for i, data in enumerate(trainloader, 0):
+		# get the inputs; data is a list of [inputs, labels]
+		inputs, labels = data
 
-		running_loss = 0.0
-		for i, data in enumerate(trainloader, 0):
-			# get the inputs; data is a list of [inputs, labels]
-			inputs, labels = data
+		# zero the parameter gradients
+		optimizer.zero_grad()
 
-			# zero the parameter gradients
-			optimizer.zero_grad()
+		# forward + backward + optimize
+		outputs = model(inputs)
+		loss = criterion(outputs, labels.float())
+		loss.backward()
+		optimizer.step()
 
-			# forward + backward + optimize
-			outputs = nets[compound](inputs)
-			loss = criterion(outputs, labels)
-			loss.backward()
-			optimizer.step()
+		running_loss += loss.item()
+	# print epoch statistics
+	print('[%d] loss: %.3f' %
+		(epoch + 1, running_loss / len(X_train_tensor) * batch_size))
 
-			running_loss += loss.item()
-		# print epoch statistics
-		print('[%d] loss: %.3f' %
-			(epoch + 1, running_loss / len(X_train_tensor) * batch_size))
+train_outputs = model(X_train_tensor)
+_, train_prediction = torch.max(train_outputs, 1)
 
-	train_outputs = nets[compound](X_train_tensor)
-	_, train_predictions[compound] = torch.max(train_outputs, 1)
+val_outputs = model(X_val_tensor)
+_, val_prediction = torch.max(val_outputs, 1)
 
-	val_outputs = nets[compound](X_val_tensor)
-	_, val_predictions[compound] = torch.max(val_outputs, 1)
+test_outputs = model(X_test_tensor)
+_, test_prediction = torch.max(test_outputs, 1)
 
-	test_outputs = nets[compound](X_test_tensor)
-	_, test_predictions[compound] = torch.max(test_outputs, 1)
-
-	print("The train accuracy was {:.3f}".format(accuracy_score(train_predictions[compound], y_train_tensor)))
-	print("The val accuracy was {:.3f}".format(accuracy_score(val_predictions[compound], y_val_tensor)))
+print("The train accuracy was {:.3f}".format(accuracy_score(train_prediction, y_train_tensor)))
+print("The val accuracy was {:.3f}".format(accuracy_score(val_predictions, y_val_tensor)))
 # %%
 print(compounds)
 compound = 'basalt'
@@ -302,3 +295,12 @@ y_train_tensor[0:20]
 train_predictions[compound][0:20]
 #%%
 dataset.train_labels[compound][0:10]
+
+
+#%%
+from tensorflow import keras
+from tensorflow.keras import layers
+model = keras.Sequential([
+    layers.Dense(512, activation="relu"),
+    layers.Dense(10, activation="softmax")
+])
