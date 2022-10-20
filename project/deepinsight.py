@@ -1,4 +1,6 @@
 #%%
+import os
+from pprint import pprint
 import pandas as pd
 from sklearn.manifold import TSNE
 from pyDeepInsight import ImageTransformer
@@ -16,6 +18,8 @@ import torchvision.transforms as transforms
 from torch.utils.data import TensorDataset, DataLoader
 import torch.nn as nn
 import torch.optim as optim
+import torch.nn.functional as F
+
 
 from sklearn.preprocessing import LabelEncoder, OneHotEncoder
 from sklearn.metrics import accuracy_score
@@ -226,17 +230,132 @@ val_predictions = {}
 test_predictions = {}
 
 
-model = torch.hub.load(
+squeezenet = torch.hub.load(
 	'pytorch/vision:v0.6.0', 'squeezenet1_1', 
 	pretrained=False, verbose=False).double()
 
-model.classifier[1] = nn.Conv2d(512, 10, kernel_size=(1,1), stride=(1,1)).double()
+mobilenet = torch.hub.load('pytorch/vision:v0.10.0', 'mobilenet_v2', pretrained=True)
+
+
+squeezenet.classifier[1] = nn.Conv2d(512, 10, kernel_size=(1,1), stride=(1,1)).double()
 
 #%%
-list(model.children())[-3:]
+pprint(mobilenet.__dict__)
+pprint(squeezenet.__dict__)
 
 #%%
+class MobileNetCompoundsOutput(nn.Module):
+    def __init__(self, model, compounds):
+        super().__init__()
+        self.base_model = model.features  # take the model without classifier
+        last_channel = model.last_channel # size of the layer before the classifier
 
+        # the input for the classifier should be two-dimensional, but we will have
+        # [<batch_size>, <channels>, <width>, <height>]
+        # so, let's do the spatial averaging: reduce <width> and <height> to 1
+        self.pool = nn.AdaptiveAvgPool2D((1, 1))
+
+        self.classifiers = {}
+
+        for compound in compounds:
+            # add a new classifier for each compound
+            # create separate classifiers for our outputs
+            self.classifiers['compound'] = nn.Sequential(
+            nn.Dropout(p=0.2),
+            nn.Linear(in_features=last_channel, out_features=2)
+        )
+
+    def forward(self, x):
+        x = self.base_model(x)
+        x = self.pool(x)
+
+        # reshape from [batch, channels, 1, 1] to [batch, channels] to put it into classifier
+        x = torch.flatten(x, start_dim=1)
+
+        return {compound: classifier(x) for compound, classifier in self.classifiers.items()}
+
+    def get_loss(self, net_output, ground_truth):
+
+        losses = {compound: F.cross_entropy(net_output[compound], ground_truth[compound]) for compound in self.classifiers.items()}
+
+        loss = sum(list(losses.values()))
+
+        return loss, losses
+
+
+#%%
+class CompoundDataset(TensorDataset):
+    def __init__(self, data, labels):
+        self.data = data
+        self.labels = labels
+
+    def __getitem__(self, index):
+        return self.data[index], self.labels[index]
+
+    def __len__(self):
+        return len(self.data)
+
+#%%
+import warnings
+from sklearn.metrics import confusion_matrix, ConfusionMatrixDisplay, accuracy_score
+
+def calculate_metrics(output, target, compunds):
+    predicted = {}
+    gt = {}
+    accuracy = {}
+
+    {predicted[compound]: output[compound].cpu().max(1) for compound in compounds} 
+
+    {gt[compound]: target[compound].cpu() for compound in compounds}
+
+    with warnings.catch_warnings():  # sklearn may produce a warning when processing zero row in confusion matrix
+        warnings.simplefilter("ignore")
+
+        {accuracy[compound]: accuracy_score(y_true = gt[compound].numpy(), y_pred = predicted[compound].numpy()) for compound in compounds}
+
+    return accuracy
+
+def checkpoint_load(model, name):
+    print('Restoring checkpoint: {}'.format(name))
+    model.load_state_dict(torch.load(name, map_location='cpu'))
+    epoch = int(os.path.splitext(os.path.basename(name))[0].split('-')[1])
+    return epoch
+
+
+def net_output_to_predictions(output, compounds):
+
+    predictions = {}
+    {predictions[compound]: output[compound].cpu().max(1) for compound in compounds}
+
+    return [predictions[compound].nump().tolist() for compound in compounds]
+
+def validate(model, val_loader, device, compounds, logger=None, checkpoint=None):
+
+    if checkpoint is not None:
+        checkpoint_load(model, checkpoint)
+
+    model.eval()
+    val_loss = 0
+    val_accuracy = {}
+
+    predictions = []
+
+    with torch.no_grad():
+        avg_loss = 0
+        accuracy = {}
+
+        {accuracy[compound]: 0 for compound in compounds}
+
+        for data, target in val_loader:
+            data, target = data.to(device), target.to(device)
+            output = model(data)
+            val_loss += F.cross_entropy(output, target, reduction='sum').item()  # sum up batch loss
+            val_accuracy = calculate_metrics(output, target, compounds)
+
+    val_loss /= len(val_loader.dataset)
+    return val_loss, val_accuracy
+
+#%%
 y_train_tensor = torch.from_numpy(dataset.train_labels.values)
 y_val_tensor = torch.from_numpy(dataset.val_labels.values)
 
@@ -245,12 +364,24 @@ batch_size = 1
 trainset = TensorDataset(X_train_tensor, y_train_tensor)
 trainloader = DataLoader(trainset, batch_size=batch_size, shuffle=True)
 
+valset = TensorDataset(X_val_tensor, y_val_tensor)
+
+compound = dataset.train_labels.columns
+
+device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+
+model = MobileNetCompoundsOutput(mobilenet, compounds).to(device)
+
 criterion = nn.CrossEntropyLoss()
+
 optimizer = optim.SGD(model.parameters(), lr=1e-4, momentum=0.9)
 
-for epoch in range(20):
+N_epochs = 20
+
+for epoch in range(N_epochs+1):
 
 	running_loss = 0.0
+
 	for i, data in enumerate(trainloader, 0):
 		# get the inputs; data is a list of [inputs, labels]
 		inputs, labels = data
@@ -259,9 +390,12 @@ for epoch in range(20):
 		optimizer.zero_grad()
 
 		# forward + backward + optimize
-		outputs = model(inputs)
+		outputs = model(inputs.to(device))
+
 		loss = criterion(outputs, labels.float())
+
 		loss.backward()
+
 		optimizer.step()
 
 		running_loss += loss.item()
